@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ES 期货研究图表</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#dbe5f1;background:#101722;color-scheme:dark;font-size:12px}
+*{box-sizing:border-box}body{margin:0}main{height:100vh;height:100dvh;min-height:440px;display:flex;flex-direction:column;padding:6px 10px;gap:0}
+h1{font-size:16px;font-weight:600;letter-spacing:.03em;margin:0 12px 0 0;white-space:nowrap}p{margin:0;color:#a9b8ca}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:5px 0}label{display:flex;align-items:center;gap:5px;color:#9aabba;font-size:11px;white-space:nowrap}
+input,select,button{background:#172231;color:#dbe5f1;border:1px solid #304156;border-radius:4px;padding:4px 7px;font:inherit;min-height:28px}input[type=date]{width:132px}input[type=time]{width:102px}
+button{cursor:pointer}button.primary{background:#285fae;border-color:#285fae}button:disabled{opacity:.45;cursor:default}button:hover:enabled{border-color:#8ab8ff}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid #8ab8ff;outline-offset:2px}[hidden]{display:none!important}
+.utility{display:flex;gap:14px;align-items:center;min-height:27px;border-bottom:1px solid #29394d;color:#9aabba;font-size:11px}.session-hint{margin-left:auto}.utility{flex-wrap:wrap;gap:5px 10px;padding:3px 0}.utility select,.utility button{min-height:25px;padding:2px 6px;font-size:11px}.drawing-settings{width:250px;display:grid;gap:10px}.drawing-settings input[type=color]{width:46px;padding:2px}.drawing-settings input[type=text]{min-width:0;width:150px}#drawing-fib-levels{width:100%}#drawing-status{font-size:10px;color:#9aabba}#drawing-import{max-width:100%;min-width:0;font-size:10px}.drawing-settings .file-import{display:grid;white-space:normal}.menu{position:relative}.menu summary{cursor:pointer;list-style:none;padding:4px 0;color:#b9c8d8}.menu summary::after{content:' ⌄';color:#71879f}.menu summary::-webkit-details-marker{display:none}.popover{position:absolute;top:100%;left:0;z-index:10;padding:14px;background:#172231;border:1px solid #41546d;border-radius:5px;box-shadow:0 8px 24px #0006}.help .popover{left:auto;right:0;width:min(480px,calc(100vw - 28px));max-height:65vh;overflow:auto}.checks{display:grid;gap:12px;min-width:200px}.checks input{min-height:0;accent-color:#8ab8ff}.note{font-size:12px;line-height:1.8;margin-bottom:10px}
+.ema{color:#f7bc53}.adr{color:#68acff}.abr{color:#ca93f8}#transport{border-bottom:1px solid #29394d;gap:7px}#progress{font-size:11px;color:#9aabba}
+#readout{padding:6px 0;font-size:11px;font-variant-numeric:tabular-nums;line-height:1.7}#ohlc{white-space:nowrap;overflow-x:auto}#indicators{display:flex;gap:5px 16px;flex-wrap:wrap}#indicators span{white-space:nowrap}
+#chart{flex:1;min-height:200px;border:1px solid #29394d}.statusbar{display:flex;align-items:center;gap:14px;min-height:23px;font-size:10px}#status{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}footer{color:#71879f;white-space:nowrap}a{color:#8ab8ff}
+@media(max-width:700px){main{height:auto;min-height:100dvh;padding:5px 8px}.controls{gap:6px}h1{font-size:14px}label{font-size:10px}#chart{flex:none;height:65vh;min-height:320px}.session-hint{font-size:10px}#indicators{gap:3px 12px}.statusbar{align-items:start}footer{font-size:9px}#status{white-space:normal}}
+</style>
+</head>
+<body><main>
+<form id="settings">
+<div class="controls">
+  <h1>ES <span style="color:#71879f;font-weight:400">研究图表</span></h1>
+  <label>模式<select id="mode"><option value="browse">历史浏览</option><option value="replay">K 线回放</option><option value="review">早盘复盘 · 5 分钟</option></select></label>
+  <label data-range>开始日期<input id="start" type="date" required></label>
+  <label data-range>结束日期<input id="end" type="date" required></label>
+  <label data-range>周期<select id="interval"><option value="1">1 分钟</option><option value="5" selected>5 分钟</option><option value="15">15 分钟</option><option value="60">60 分钟</option></select></label>
+  <label data-range>时段<select id="session"><option value="rth">仅 RTH</option><option value="all">全部时段</option></select></label>
+  <label>价格<select id="adjustment"><option value="back">估算去换月</option><option value="raw">原始价格</option></select></label>
+  <label id="review-field" hidden>复盘日期<input id="review-date" type="date"></label>
+  <label id="replay-field" hidden>起始日回放时间<input id="replay-time" type="time" value="09:30" step="60"></label>
+  <button id="load" class="primary" type="submit">加载图表</button>
+  <button id="fit" type="button" disabled>显示全部</button>
+  <button id="center" type="button" hidden disabled>开盘居中</button>
+</div>
+</form>
+<div id="transport" class="controls" hidden>
+  <button id="play" class="primary" disabled>播放</button><button id="step" disabled>下一根 →</button><button id="reset" disabled>回到起点</button>
+  <label>播放速度<select id="speed"><option value="2000">0.5 根 / 秒</option><option value="1000" selected>1 根 / 秒</option><option value="500">2 根 / 秒</option><option value="250">4 根 / 秒</option><option value="100">10 根 / 秒</option></select></label>
+  <span id="progress">加载后开始回放 · 空格播放 / 暂停</span>
+</div>
+<div class="utility">
+<details class="menu"><summary>显示设置</summary><div class="popover"><div class="checks">
+  <label class="ema"><input id="show-ema" type="checkbox" checked>EMA_20</label>
+  <label class="adr"><input id="show-adr" type="checkbox" checked>ADR_8 · 点</label>
+  <label class="abr"><input id="show-abr" type="checkbox" checked>ABR_8 · 点</label>
+  <label><input id="show-gap" type="checkbox" checked>每日 RTH 跳空</label>
+  <label><input id="show-count" type="checkbox" checked>RTH Bar Count · 每 3 根标注</label>
+</div></div></details>
+<label>画图<select id="drawing-tool" aria-label="绘图工具"><option value="">选择 / 拖动</option><option value="trend-line">趋势射线 · 两点</option><option value="horizontal-line">支撑 / 阻力 · 一点</option><option value="measured-move">等距目标 · 三点</option><option value="fib-retracement">斐波那契 · 两点</option></select></label>
+<button id="drawing-undo" title="撤销绘图 Ctrl/Cmd+Z" disabled>↶</button><button id="drawing-redo" title="重做绘图 Ctrl/Cmd+Shift+Z" disabled>↷</button>
+<details id="drawing-settings" class="menu"><summary>绘图设置</summary><div class="popover drawing-settings">
+<label><input id="drawing-visible" type="checkbox" checked>显示绘图</label>
+<label>颜色<input id="drawing-color" type="color" value="#8ab8ff"></label>
+<label>线宽<select id="drawing-width"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option></select></label>
+<label>标注<input id="drawing-text" type="text" maxlength="80" placeholder="如：昨日高点"></label>
+<label class="file-import">回撤比例（0.5 = 50%）<input id="drawing-fib-levels" type="text" value="0,0.236,0.382,0.5,0.618,0.786,1" aria-label="斐波那契自定义回撤比例"></label>
+<button id="drawing-fib-apply">应用回撤比例 / 设为默认</button>
+<button id="drawing-apply" disabled>更新选中图形</button><button id="drawing-delete" disabled>删除选中图形</button>
+<button id="drawing-export">导出绘图 JSON</button><label class="file-import">导入 JSON<input id="drawing-import" type="file" accept=".json,application/json"></label>
+<p class="note">落点和端点拖动吸附到所指 K 线较近的高点或低点，空白区可自由投射。趋势线默认向右延伸。回撤比例用逗号分隔，可输入负数及大于 1 的扩展位。选中回撤图后应用会修改该图，也会作为新图默认值。选中后拖动端点或整条线；Esc 取消，Delete 删除。等距目标依次选择 A、B、C，目标为 C+(B−A)。绘图自动保存在当前浏览器；回放使用独立存档。</p>
+</div></details><span id="drawing-status" role="status">绘图准备中…</span>
+<details class="menu help"><summary>换月记录</summary><div class="popover"><p class="note">按季度换月窗口内的异常午夜跳变估算，不能精确分离合约基差与真实行情。原始数据保留；可在价格选项切换原价。更正记录使用项目内 roll_overrides.json。</p><pre id="roll-events" style="font-size:11px;white-space:pre-wrap;line-height:1.6">读取中…</pre></div></details><span id="adjustment-info"></span>
+<span class="session-hint">纽约时间 · RTH 09:30–16:15</span>
+<details class="menu help"><summary>说明</summary><div class="popover">
+<p class="note">EMA_20：收盘价的 20 周期指数移动平均，黄色主图线。ADR_8：此前 8 个有数据的已完成 RTH 交易日的（最高价 − 最低价）均值，不含当天。ABR_8：当前图表周期最近 8 根 K 线的（最高价 − 最低价）均值，包含当前已收盘 K 线；蓝色和紫色线显示在下方面板。历史不足显示“—”。</p>
+<p class="note">RTH 只取纽约墙上时间 09:30（含）至 16:15（不含），正常交易日为 81 根 5 分钟 K 线（末根 16:10）；按数据识别交易日。Bar Count 按开盘后周期位置编号，缺失 K 线不会让后续编号前移。早盘复盘固定显示前两交易日 RTH 与当日前 24 个 5 分钟位置（09:30–11:30），开盘居中，初始右半屏显示约 24 根，前两日历史可缩放或平移查看；源数据缺失或提前收市不会补造 K 线。回放按整根已收盘 K 线推进，暂停后可用十字光标观察已播放内容。</p>
+<p class="note">跳空 = 当日 09:30 RTH 开盘价 − 前一有数据交易日 RTH 最后收盘价（正常取 16:14 分钟收盘），百分比以前收为基准。开盘上方的小箭头显示带正负号的点数，读数条显示所选 K 线所属日的跳空点数与百分比。缺少准确开盘或前收时显示“—”。</p>
+</div></details>
+</div>
+<div id="readout" aria-label="十字光标对应K线数值"><p id="ohlc">移动十字光标查看 K 线。</p><p id="indicators"><span class="ema" id="ema-value">EMA_20 —</span><span class="adr" id="adr-value">ADR_8 —</span><span class="abr" id="abr-value">ABR_8 —</span><span id="range-value">长度 H−L — 点</span><span id="body-value">实体 |C−O| — 点</span><span id="count-value">RTH 第 — 根</span><span id="gap-value">RTH 跳空 —</span></p></div>
+<div id="chart" aria-label="ES 价格、成交量及 ADR 和 ABR 范围指标图表"></div>
+
+<div class="statusbar"><p id="status" role="status">正在读取数据范围…</p><footer><a href="https://www.tradingview.com/">TradingView</a> Lightweight Charts™ · 历史研究</footer></div>
+</main><script src="/vendor/dist/lightweight-charts.standalone.production.js"></script><script type="module" src="/app.js"></script></body></html>
