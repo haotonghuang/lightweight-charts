@@ -39,4 +39,5 @@ jobs:
         run: pnpm prepare-release
 
       - name: Publish preview package
+        if: github.repository == 'tradingview/lightweight-charts'
         run: pnpm dlx pkg-pr-new@0.0.88 publish --compact
