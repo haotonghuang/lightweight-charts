@@ -8,6 +8,7 @@ contract rolls. Adjustments are additive and leave the newest segment intact.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import csv
 import datetime as dt
 import hashlib
@@ -28,13 +29,15 @@ _OHLC = ('open', 'high', 'low', 'close')
 def _parse_stamp(stamp: str) -> dt.datetime:
     if not isinstance(stamp, str):
         raise ValueError('时间戳必须是字符串')
+    if (len(stamp) != 19 or stamp[:4] < '1000' or stamp[4] != '-' or stamp[7] != '-'
+            or stamp[10] != ' ' or stamp[13] != ':' or stamp[16] != ':'
+            or any(char not in '0123456789' for char in stamp[:4] + stamp[5:7]
+                   + stamp[8:10] + stamp[11:13] + stamp[14:16] + stamp[17:19])):
+        raise ValueError(f'无效时间戳: {stamp!r}; 预期格式 YYYY-MM-DD HH:MM:SS')
     try:
-        parsed = dt.datetime.strptime(stamp, _DATETIME_FORMAT)
+        return dt.datetime.fromisoformat(stamp)
     except ValueError as exc:
         raise ValueError(f'无效时间戳: {stamp!r}; 预期格式 YYYY-MM-DD HH:MM:SS') from exc
-    if parsed.strftime(_DATETIME_FORMAT) != stamp:
-        raise ValueError(f'无效时间戳: {stamp!r}; 预期格式 YYYY-MM-DD HH:MM:SS')
-    return parsed
 
 
 def _finite_number(value, field: str) -> float:
@@ -180,6 +183,15 @@ class RollAdjuster:
 
         self._events = tuple(by_time[stamp] for stamp in sorted(by_time))
         self._times = tuple(event['time'] for event in self._events)
+        # The normal detector emits a few dozen sparse events. Cache exact
+        # ascending-order sums for those common cases; large manual event sets
+        # retain bounded construction cost and use the bisected suffix below.
+        self._offset_suffix = None
+        if len(self._events) <= 512:
+            self._offset_suffix = tuple(
+                sum(event['delta'] for event in self._events[start:] if event['enabled'])
+                for start in range(len(self._events) + 1)
+            )
         self.total_offset = sum(event['delta'] for event in self._events if event['enabled'])
         revision_payload = {
             'algorithm': ALGORITHM,
@@ -208,8 +220,10 @@ class RollAdjuster:
     def offset_at(self, stamp: str) -> float:
         """Return the sum of enabled event deltas strictly after ``stamp``."""
         _parse_stamp(stamp)
-        return sum(event['delta'] for event in self._events
-                   if event['enabled'] and event['time'] > stamp)
+        start = bisect_right(self._times, stamp)
+        if self._offset_suffix is not None:
+            return self._offset_suffix[start]
+        return sum(event['delta'] for event in self._events[start:] if event['enabled'])
 
     def adjust_bar(self, stamp: str, bar: dict) -> dict:
         """Return an adjusted copy of an OHLCV mapping; input is not modified."""

@@ -1,5 +1,6 @@
 import { createDrawingController } from './drawings.js';
 import { Replay, countMarkers, openingRange, replayStartTime, gapMarkers } from './replay.js';
+import { createEncyclopedia } from './encyclopedia.js';
 
 const { createChart, CandlestickSeries, HistogramSeries, LineSeries, createSeriesMarkers } = LightweightCharts;
 const $ = id => document.getElementById(id);
@@ -39,6 +40,84 @@ let loading = false;
 let dirty = false;
 let rollRevision = 'v1';
 let rollEventCount = 0;
+let dataSource = null;
+let loadedContext = null;
+let selectedSignal = null;
+let navigationRevision = 0;
+let encyclopedia = null;
+
+function signalContext() {
+  if (loading || dirty || !loadedContext || !selectedSignal || !records.has(selectedSignal.time)) {
+    throw new Error('请先加载图表，再点击一根 RTH 信号 K 线');
+  }
+  return { ...loadedContext, date: stamp(selectedSignal.time).slice(0, 10), time: selectedSignal.time, barNumber: selectedSignal.barCount };
+}
+
+function selectSignal(bar) {
+  selectedSignal = bar?.barCount > 0 ? bar : null;
+  const label = $('case-selection');
+  if (label) label.textContent = selectedSignal
+    ? `信号：${stamp(selectedSignal.time).slice(0, 10)} bar ${selectedSignal.barCount}`
+    : '点击 RTH K 线选定信号';
+  encyclopedia?.setSelection(selectedSignal && loadedContext ? signalContext() : null);
+  syncControls();
+  updateMarkers();
+}
+
+export async function navigateCase(item) {
+  const revision = ++navigationRevision;
+  pause();
+  if (loading) {
+    controller?.abort();
+    loading = false;
+    dirty = true;
+    $('load').disabled = false;
+    $('status').textContent = '已取消上一次加载。';
+    syncControls();
+  }
+  if (!dataSource) throw new Error('行情初始化尚未完成，请稍后重试');
+  if (item.dataSource !== dataSource) throw new Error(`案例数据源为 ${item.dataSource}，当前加载的是 ${dataSource}`);
+  if (item.adjustment === 'back' && item.rollRevision !== rollRevision) {
+    throw new Error('此案例的换月调整版本与当前数据不同，请核对原始案例后重新收录');
+  }
+  drawingAction(d => d?.setTool(null));
+  const reusable = !loading && !dirty && activeMode === 'browse' && records.has(item.time)
+    && loadedContext && ['interval', 'session', 'adjustment', 'dataSource'].every(key => loadedContext[key] === item[key]);
+  if (!reusable) {
+    $('mode').value = 'browse';
+    $('interval').value = String(item.interval);
+    $('session').value = item.session;
+    $('adjustment').value = item.adjustment;
+    const day = new Date(`${item.date}T00:00:00Z`);
+    day.setUTCDate(day.getUTCDate() - 7);
+    $('start').value = day.toISOString().slice(0, 10);
+    $('end').value = item.date;
+    configureMode();
+    const success = await load({ navigation: true });
+    if (revision !== navigationRevision) throw new DOMException('已切换到其他案例', 'AbortError');
+    if (!success) throw new Error($('status').textContent);
+  }
+  if (revision !== navigationRevision) throw new DOMException('已切换到其他案例', 'AbortError');
+  const bar = records.get(item.time);
+  if (!bar || bar.barCount !== item.barNumber) throw new Error('数据中未找到对应信号 K 线，请核对日期、编号和数据源');
+  selectSignal(bar);
+  const index = visible.findIndex(candidate => candidate.time === item.time);
+  chart.timeScale().setVisibleLogicalRange({ from: index - 32, to: index + 20 });
+  chart.setCrosshairPosition?.(bar.close, bar.time, candles);
+  readout(bar);
+  $('status').textContent = `案例：${item.date} bar ${item.barNumber} · ${item.interval} 分钟 · ${item.session.toUpperCase()} · 已定位信号 K 线`;
+}
+
+if ($('encyclopedia')) {
+  encyclopedia = createEncyclopedia({ host: $('encyclopedia'), onNavigate: navigateCase, onCapture: signalContext });
+  $('encyclopedia-toggle').addEventListener('click', () => { $('encyclopedia').hidden = !$('encyclopedia').hidden; });
+  new MutationObserver(() => $('encyclopedia-toggle').setAttribute('aria-expanded', String(!$('encyclopedia').hidden)))
+    .observe($('encyclopedia'), { attributes: true, attributeFilter: ['hidden'] });
+  $('case-capture').addEventListener('click', async () => {
+    try { pause(); await encyclopedia.capture(signalContext()); }
+    catch (error) { $('status').textContent = error.message; }
+  });
+}
 
 let drawingController = null;
 let drawingContextRevision = 0;
@@ -114,6 +193,30 @@ function readout(bar) {
   $('count-value').textContent = `RTH 第 ${bar?.barCount ?? '—'} 根`;
 }
 chart.subscribeCrosshairMove(param => readout(records.get(param.time) ?? visible.at(-1)));
+function selectChartSignal(time) {
+  if (loading || dirty || $('drawing-tool').value) return;
+  const bar = records.get(time);
+  if (bar) selectSignal(bar);
+}
+chart.subscribeClick?.(param => selectChartSignal(param.time));
+// The chart can suppress its click callback after focus leaves for the sidebar.
+// A stationary native click also selects the signal; drags remain chart gestures.
+let signalPointer = null;
+$('chart').addEventListener('pointerdown', event => {
+  signalPointer = event.button === 0 ? { x: event.clientX, y: event.clientY, moved: false } : null;
+});
+$('chart').addEventListener('pointermove', event => {
+  if (signalPointer && Math.abs(event.clientX - signalPointer.x) + Math.abs(event.clientY - signalPointer.y) >= 5) signalPointer.moved = true;
+});
+$('chart').addEventListener('pointercancel', () => { signalPointer = null; });
+$('chart').addEventListener('click', event => {
+  const pointer = signalPointer;
+  signalPointer = null;
+  if (!pointer || pointer.moved || event.defaultPrevented || event.button !== 0) return;
+  const element = $('chart');
+  const x = event.clientX - element.getBoundingClientRect().left - element.clientLeft;
+  selectChartSignal(chart.timeScale().coordinateToTime(x));
+});
 
 function updateMarkers() {
   const data = $('show-count').checked ? countMarkers(visible) : [];
@@ -122,6 +225,9 @@ function updateMarkers() {
     const opening = data.find(marker => marker.time === review.focusTime && marker.position === 'aboveBar');
     if (opening) opening.text = `当日开盘 · ${opening.text}`;
     else data.push({ time: review.focusTime, position: 'aboveBar', shape: 'arrowDown', color: '#f7bc53', text: '当日开盘' });
+  }
+  if (selectedSignal && records.has(selectedSignal.time)) {
+    data.push({ time: selectedSignal.time, position: 'belowBar', shape: 'arrowUp', color: '#8ab8ff', text: `信号 bar ${selectedSignal.barCount}` });
   }
   data.sort((a, b) => a.time - b.time);
   markers.setMarkers(data);
@@ -133,6 +239,11 @@ function render(bars) {
   // The chart and hover map always consume the same revealed slice.
   visible = bars;
   records = new Map(bars.map(bar => [bar.time, bar]));
+  if (selectedSignal && !records.has(selectedSignal.time)) {
+    selectedSignal = null;
+    if ($('case-selection')) $('case-selection').textContent = '点击 RTH K 线选定信号';
+    encyclopedia?.setSelection(null);
+  }
   candles.setData(bars.map(({ time, open, high, low, close }) => ({ time, open, high, low, close })));
   volume.setData(bars.map(bar => ({ time: bar.time, value: bar.volume, color: bar.close >= bar.open ? '#26a69a80' : '#ef535080' })));
   ema.setData(lineData(bars, 'ema20'));
@@ -144,6 +255,7 @@ function render(bars) {
   syncControls();
 }
 function syncControls() {
+  if ($('case-capture')) $('case-capture').disabled = loading || dirty || !loadedContext || !selectedSignal;
   const ready = replay && !loading && !dirty && activeMode === 'replay';
   $('drawing-tool').disabled = !drawingController || loading || dirty || !visible.length;
   $('play').disabled = !ready || replay.complete;
@@ -198,12 +310,14 @@ function configureMode() {
   $('center').hidden = mode !== 'review';
   $('load').textContent = mode === 'review' ? '加载早盘' : mode === 'replay' ? '准备回放' : '加载图表';
 }
-async function load() {
+async function load({ navigation = false } = {}) {
+  if (!navigation) navigationRevision++;
   pause();
   controller?.abort();
   const request = new AbortController();
   controller = request;
   loading = true;
+  loadedContext = null;
   dirty = false;
   replay = null;
   review = null;
@@ -235,6 +349,10 @@ async function load() {
     if (!response.ok) throw new Error(payload.error || '读取失败');
     if (request.signal.aborted) return;
     const bars = mode === 'review' ? payload.bars : payload;
+    loadedContext = {
+      dataSource, interval: mode === 'review' ? 5 : Number(params.get('interval')),
+      session: mode === 'review' ? 'rth' : params.get('session'), adjustment, rollRevision,
+    };
     if (mode === 'review') review = payload;
     if (mode === 'replay') replay = new Replay(bars, startTime, Number(params.get('interval')) * 60);
     render(replay ? replay.visible() : bars);
@@ -246,8 +364,10 @@ async function load() {
       ? `从 ${start} ${replayTime} 所在的 K 线起逐根回放；之前的 ${replay.start} 根为已知背景。`
       : '起始时刻之后没有 K 线，请调整日期、时刻或时段。';
     else $('status').textContent = `已加载 ${bars.length.toLocaleString()} 根 K 线。滚轮缩放，拖动平移；下方面板为 ADR / ABR（点）。`;
+    return true;
   } catch (error) {
-    if (error.name !== 'AbortError') $('status').textContent = `加载失败：${error.message}`;
+    if (!request.signal.aborted && controller === request && error.name !== 'AbortError') $('status').textContent = `加载失败：${error.message}`;
+    return false;
   } finally {
     if (controller === request) {
       loading = false;
@@ -258,6 +378,7 @@ async function load() {
 }
 $('settings').addEventListener('submit', event => { event.preventDefault(); load(); });
 $('settings').addEventListener('change', () => {
+  navigationRevision++;
   pause();
   controller?.abort();
   loading = false;
@@ -297,6 +418,7 @@ configureMode();
     const response = await fetch('/api/meta');
     if (!response.ok) throw new Error('无法读取数据范围');
     const meta = await response.json();
+    dataSource = meta.dataFile;
     rollRevision = meta.rollAdjustment?.revision ?? 'v1';
     const events = meta.rollAdjustment?.events ?? [];
     rollEventCount = events.filter(event => event.enabled).length;

@@ -23,6 +23,22 @@ python3 es-research/server.py
 
 主图显示 K 线、EMA20 和成交量，下方面板显示 ADR8 / ABR8（单位：点）。各指标和 Bar Count 都可独立开关。回放时所有图形、指标读数和计数标记只使用已播放切片；这是一款本地练习工具，浏览器仍会预取所选区间数据，不提供防查看网络数据的考试模式。
 
+## 阿布图表百科
+
+工具行的“阿布图表百科”打开侧栏，与现有图表共用同一个页面和图表实例。Setup 类别承载背景与入场理由；跨类别复用的特性标签用于记录 `strong buying`、`just above EMA`、不利因素等。每个案例可以属于多个 setup，并添加多个标签和可选备注，无需填写真实成交或盈亏。
+
+1. 收录案例后，可以直接在编辑区的“新建 setup”“新建标签”输入名称，点击“添加并选中”（或按回车）；创建后自动关联当前案例，同名选项直接复用，也会保留已写备注。“管理 setup 与标签”仍可用于预建、改名和编辑说明。仍被案例引用的条目不能删除，需先修改案例关联。
+2. 在图表中点击一根 **RTH 信号 K 线**，核对工具行的 `YYYY-MM-DD bar N`，点击“收录信号 K 线”，选择 setup、标签后保存。这里的 bar N 指信号 K 线，而非之后实际触发或成交的 K 线。绘图工具激活时先切回“选择 / 拖动”。
+3. 用 setup 下拉框、标签复选项筛选案例。多标签默认全部满足（AND），也可选择任一满足（OR）；搜索支持日期、bar 编号和备注。
+4. 点击案例，或用“上一个 / 下一个”连续查看。现有图表会恢复该案例的周期、时段、价格口径，定位并高亮信号 K 线；筛选和列表滚动位置保留，不新开窗口。需要换日期时在原图加载；快速切换以最后一次选择为准。
+5. 点击案例旁“编辑”修改关联、标签和备注或删除案例。新案例草稿的信号位置在收录时固定，继续查看其他行情不会悄悄改变它。
+
+案例按实际时间戳定位，同时保存 bar 编号、数据文件名和估算去换月版本。源数据缺失、数据源不同或调整版本变化时会提示，避免错误跳转。正常查看可以看到后续行情；专门的隐藏答案练习模式和截图附件暂未加入。没有 RTH 编号的盘外 K 线及跨 RTH 边界的全部时段 60 分钟 K 线不支持收录。
+
+百科自动保存在 `es-research/data/encyclopedia.sqlite3`，关闭或重启服务、清理浏览器存储不会删除案例。可用 `--encyclopedia-db /完整路径/百科.sqlite3` 指定其他位置；数据库由 Git 忽略，需自行备份。绘图仍使用原有浏览器存档，与百科记录独立。
+
+“导出百科 JSON”包含全部 setup、标签、案例及关联；“恢复百科 JSON”会在确认后替换当前百科，并在事务中完整校验，失败时保留原记录。支持最大 64 MB 的 JSON 备份，导出时会检查同一限制；setup、标签、案例各最多 20,000 条，达到数量上限后仍可编辑已有记录。百科加载失败可点击“重试加载百科”，不影响行情查看。
+
 ## 画图与标注
 
 工具行的“画图”提供四种工具：
@@ -72,6 +88,14 @@ python3 es-research/server.py
 
 只读审计命令：`python3 es-research/roll_adjustment.py scan --csv es-research/data/ES_1min.csv --overrides es-research/roll_overrides.json`。
 
+## 日期切换性能
+
+服务按需缓存每日聚合 K 线，重复或相邻日期查询可复用此前 80 个交易日的聚合结果；EMA／ABR 仍按原有预热窗口计算，缓存不包含未来行情或跨请求共享的指标状态。缓存按日期、周期、时段、价格口径和换月版本隔离，最多保留 200,000 根聚合 K 线及 1,024 个每日条目，超限时淘汰最近最少使用的条目。缓存只在当前服务进程内存在，重启后首次查询需要重新读取。
+
+CSV 仍是唯一行情来源，无需转换 Parquet 或安装新依赖。服务还减少了盘外数据的日期解析，以及每根 K 线重复解析时间和扫描换月记录的工作。CSV 文件在运行期间变化时会提示重启服务重新索引，不会继续使用旧偏移和旧缓存；修改换月覆盖文件也需要重启。
+
+可用 `python3 es-research/benchmark_dates.py --date 2017-03-14` 重现首次、重复和相邻日期的后端耗时测量。当前数据实测：优化前单日 5 分钟 RTH 查询约 1.8 秒，优化后首次约 0.53 秒、重复／相邻日期约 0.03–0.04 秒；实际速度取决于机器、周期、区间和缓存状态，不含浏览器渲染时间。
+
 ## 指标与时段
 
 | 项目 | 定义 |
@@ -102,13 +126,17 @@ python3 -m unittest discover -s es-research -p 'test_*.py' -v
 node es-research/test_replay.mjs
 node es-research/test_app.mjs
 node es-research/test_drawings.mjs
+node es-research/test_encyclopedia.mjs
 node --check es-research/app.js
 node --check es-research/replay.js
+node --check es-research/encyclopedia.js
 ```
 
 如有 Playwright / Chromium 环境，还可运行 `node es-research/test_drawings_browser.mjs` 做真实鼠标验收；Playwright 位于外部目录时用 `PLAYWRIGHT_MODULE` 指定其入口，`DRAWINGS_URL` 可指定本机服务地址。浏览器测试依赖只用于开发验证，正常使用图表无需安装。
 
 服务启动后可另运行 `python3 es-research/smoke_server.py --port 8765` 做只读 HTTP 检查，核对真实数据指标、复盘切片、网页资源和错误响应；端口应与运行中的服务一致。
+
+百科另提供真实浏览器测试 `es-research/test_encyclopedia_browser.mjs`，覆盖收录、多 setup／标签、AND／OR 筛选、同图跳转、固定草稿定位、编辑改名、备份恢复、刷新持久化和窄屏。先在独立终端以 `python3 es-research/server.py --port 8877 --encyclopedia-db /tmp/abu-qa.sqlite3` 启动服务，确认该测试数据库为空，再运行 `ENCYCLOPEDIA_QA_WRITES=1 node es-research/test_encyclopedia_browser.mjs`。可用 `PLAYWRIGHT_MODULE` 指定 Playwright 入口、`ENCYCLOPEDIA_URL` 指定本机地址。测试会写入并清理测试记录，拒绝使用已有案例、setup 或标签的数据库；截图和下载保存在 `/tmp/abu-chart-qa`。
 
 测试覆盖合成 OHLC 聚合、RTH 边界、缺失位置、指标预热与无前视、前两实际交易日选择、24 根早盘切片，以及前端实际事件处理中的回放、隐藏未来指标/标记/悬浮读数、暂停、重置、请求失效与错误状态。前端逻辑测试使用 DOM / chart 边界替身验证传入图表的数据；绘图另提供真实 Chromium 鼠标交互测试，验证创建、选择、拖动、编辑、删除、撤销及持久化。
 

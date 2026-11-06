@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ES 期货研究图表</title>
+<link rel="stylesheet" href="/encyclopedia.css">
 <style>
 :root{font-family:system-ui,sans-serif;color:#dbe5f1;background:#101722;color-scheme:dark;font-size:12px}
 *{box-sizing:border-box}body{margin:0}main{height:100vh;height:100dvh;min-height:440px;display:flex;flex-direction:column;padding:6px 10px;gap:0}
@@ -15,6 +16,8 @@ button{cursor:pointer}button.primary{background:#285fae;border-color:#285fae}but
 #readout{padding:6px 0;font-size:11px;font-variant-numeric:tabular-nums;line-height:1.7}#ohlc{white-space:nowrap;overflow-x:auto}#indicators{display:flex;gap:5px 16px;flex-wrap:wrap}#indicators span{white-space:nowrap}
 #chart{flex:1;min-height:200px;border:1px solid #29394d}.statusbar{display:flex;align-items:center;gap:14px;min-height:23px;font-size:10px}#status{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}footer{color:#71879f;white-space:nowrap}a{color:#8ab8ff}
 @media(max-width:700px){main{height:auto;min-height:100dvh;padding:5px 8px}.controls{gap:6px}h1{font-size:14px}label{font-size:10px}#chart{flex:none;height:65vh;min-height:320px}.session-hint{font-size:10px}#indicators{gap:3px 12px}.statusbar{align-items:start}footer{font-size:9px}#status{white-space:normal}}
+.chart-workspace{display:flex;flex:1;min-height:200px;gap:8px;min-width:0;overflow:hidden}.chart-workspace #chart{min-width:0}
+@media(max-width:700px){.chart-workspace{flex:none;flex-direction:column;overflow:visible}.chart-workspace #chart{width:100%}}
 </style>
 </head>
 <body><main>
@@ -40,6 +43,8 @@ button{cursor:pointer}button.primary{background:#285fae;border-color:#285fae}but
   <span id="progress">加载后开始回放 · 空格播放 / 暂停</span>
 </div>
 <div class="utility">
+<button id="encyclopedia-toggle" aria-controls="encyclopedia" aria-expanded="false">阿布图表百科</button>
+<button id="case-capture" disabled>收录信号 K 线</button><span id="case-selection" role="status">点击 K 线选定信号</span>
 <details class="menu"><summary>显示设置</summary><div class="popover"><div class="checks">
   <label class="ema"><input id="show-ema" type="checkbox" checked>EMA_20</label>
   <label class="adr"><input id="show-adr" type="checkbox" checked>ADR_8 · 点</label>
@@ -69,7 +74,10 @@ button{cursor:pointer}button.primary{background:#285fae;border-color:#285fae}but
 </div></details>
 </div>
 <div id="readout" aria-label="十字光标对应K线数值"><p id="ohlc">移动十字光标查看 K 线。</p><p id="indicators"><span class="ema" id="ema-value">EMA_20 —</span><span class="adr" id="adr-value">ADR_8 —</span><span class="abr" id="abr-value">ABR_8 —</span><span id="range-value">长度 H−L — 点</span><span id="body-value">实体 |C−O| — 点</span><span id="count-value">RTH 第 — 根</span><span id="gap-value">RTH 跳空 —</span></p></div>
+<div class="chart-workspace">
+<aside id="encyclopedia" aria-label="阿布图表百科" hidden></aside>
 <div id="chart" aria-label="ES 价格、成交量及 ADR 和 ABR 范围指标图表"></div>
+</div>
 
 <div class="statusbar"><p id="status" role="status">正在读取数据范围…</p><footer><a href="https://www.tradingview.com/">TradingView</a> Lightweight Charts™ · 历史研究</footer></div>
 </main><script src="/vendor/dist/lightweight-charts.standalone.production.js"></script><script type="module" src="/app.js"></script></body></html>

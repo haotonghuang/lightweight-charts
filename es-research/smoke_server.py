@@ -63,10 +63,15 @@ def main():
     assert b'replayStartTime' in get('/app.js')
     assert b'export class Replay' in get('/replay.js')
     assert b'createDrawingController' in get('/drawings.js')
+    assert b'createEncyclopedia' in get('/encyclopedia.js')
+    assert b'encyclopedia-host' in get('/encyclopedia.css')
+    encyclopedia = get('/api/encyclopedia')
+    assert encyclopedia['version'] == 1
+    assert all(isinstance(encyclopedia[key], list) for key in ('setups', 'tags', 'cases'))
     assert b'DrawingManager' in get('/vendor/drawing/lightweight-charts-drawing-0.6.3.mjs')
     assert b'MIT' in get('/vendor/drawing/LICENSE')
     assert b'LightweightCharts' in get('/vendor/dist/lightweight-charts.standalone.production.js')
-    for path in ['/data/ES_1min.csv', '/server.py', '/README.md', '/data/', '/%64ata/ES_1min.csv']:
+    for path in ['/data/ES_1min.csv', '/data/encyclopedia.sqlite3', '/encyclopedia_store.py', '/server.py', '/README.md', '/data/', '/%64ata/ES_1min.csv']:
         get(path, 404)
     get('/api/bars?start=2026-01-01&end=2026-03-01&interval=5', 400)
     get('/api/review?date=invalid', 400)

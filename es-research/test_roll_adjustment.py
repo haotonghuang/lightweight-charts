@@ -1,10 +1,11 @@
 import json
+import datetime as dt
 import math
 import tempfile
 import unittest
 from pathlib import Path
 
-from roll_adjustment import RollAdjuster, audit_csv, detect_roll, load_overrides, validate_overrides
+from roll_adjustment import RollAdjuster, _parse_stamp, audit_csv, detect_roll, load_overrides, validate_overrides
 
 
 def roll(stamp, gap):
@@ -20,6 +21,15 @@ def roll(stamp, gap):
 
 
 class DetectRollTests(unittest.TestCase):
+    def test_timestamp_parser_requires_the_canonical_fixed_width_format(self):
+        self.assertEqual(_parse_stamp('2024-03-14 09:30:00').isoformat(' '), '2024-03-14 09:30:00')
+        for stamp in ('2024-3-14 09:30:00', '2024-03-14T09:30:00',
+                      '2024-03-14\t09:30:00', '2024-03-14 9:30:00',
+                      '2024-03-14 09:30:00.000', '2024-02-30 09:30:00',
+                      '２０２４-03-14 09:30:00', '0999-01-01 00:00:00', None):
+            with self.subTest(stamp=stamp), self.assertRaises(ValueError):
+                _parse_stamp(stamp)
+
     def test_detects_positive_and_negative_quarterly_gap(self):
         positive = detect_roll('2024-03-14 23:59:00', 5000, '2024-03-15 00:00:00', 5010)
         negative = detect_roll('2024-06-13 23:59:00', 5000, '2024-06-14 00:00:00', 4990)
@@ -42,6 +52,23 @@ class DetectRollTests(unittest.TestCase):
 
 
 class RollAdjusterTests(unittest.TestCase):
+    def test_offsets_match_original_ordered_sum_for_fractional_deltas(self):
+        deltas = [0.1, 0.2, 0.3]
+        stamps = ['2024-03-14 00:00:00', '2024-06-14 00:00:00', '2024-09-13 00:00:00']
+        adjuster = RollAdjuster([roll(stamp, delta) for stamp, delta in zip(stamps, deltas)])
+        self.assertEqual(adjuster.offset_at('2024-03-13 23:59:00'), sum(deltas))
+        self.assertEqual(adjuster.offset_at(stamps[0]), sum(deltas[1:]))
+        self.assertEqual(adjuster.offset_at(stamps[1]), deltas[2])
+
+    def test_large_event_set_uses_bounded_fallback_with_ordered_sums(self):
+        start = dt.datetime(2024, 1, 1)
+        deltas = [0.1, 0.2, 0.3] * 171
+        events = [roll((start + dt.timedelta(minutes=index)).strftime('%Y-%m-%d %H:%M:%S'), delta)
+                  for index, delta in enumerate(deltas)]
+        adjuster = RollAdjuster(events)
+        query = (start - dt.timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
+        self.assertEqual(adjuster.offset_at(query), sum(deltas))
+
     def test_offsets_accumulate_and_event_bar_uses_new_segment_basis(self):
         adjuster = RollAdjuster([
             roll('2024-06-14 00:00:00', -5),

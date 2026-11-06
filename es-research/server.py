@@ -4,22 +4,29 @@ import argparse
 import csv
 import datetime as dt
 import json
-from collections import deque
-from dataclasses import dataclass
+import sqlite3
+import threading
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from encyclopedia_store import EncyclopediaStore
 from roll_adjustment import RollAdjuster, detect_roll, load_overrides
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CSV = ROOT / 'data' / 'ES_1min.csv'
 DEFAULT_ROLL_OVERRIDES = ROOT / 'roll_overrides.json'
+DEFAULT_ENCYCLOPEDIA_DB = ROOT / 'data' / 'encyclopedia.sqlite3'
+MAX_ENCYCLOPEDIA_REQUEST = 64_001_000
 RTH_OPEN = 9 * 60 + 30
 RTH_CLOSE = 16 * 60 + 15
 EMA_PERIOD = 20
 EMA_ALPHA = 2 / (EMA_PERIOD + 1)
 EMA_WARMUP_SESSIONS = 80
+MAX_CACHED_BARS = 200_000
+MAX_CACHED_DAYS = 1024
 
 
 @dataclass
@@ -29,6 +36,10 @@ class DataIndex:
     rth_sessions: list
     roll_adjuster: object = None
     adjusted_daily: dict = None
+    source_signature: tuple = None
+    bar_cache: OrderedDict = field(default_factory=OrderedDict, repr=False)
+    bar_cache_rows: int = 0
+    bar_cache_lock: object = field(default_factory=threading.Lock, repr=False)
 
     @property
     def first(self):
@@ -48,6 +59,7 @@ def _date_and_minutes(stamp):
 
 def build_index(path, roll_overrides=None):
     """Index day offsets and collect weekday RTH ranges and session endpoints."""
+    signature = _source_signature(path)
     day_offsets = {}
     rth_daily = {}
     roll_events = []
@@ -102,12 +114,21 @@ def build_index(path, roll_overrides=None):
     sessions = sorted(rth_daily)
     index = DataIndex(day_offsets, rth_daily, sessions, RollAdjuster(roll_events, roll_overrides))
     index.adjusted_daily = _adjusted_daily(path, index)
+    if _source_signature(path) != signature:
+        raise ValueError('CSV 在索引期间发生变化，请重启服务重新索引')
+    index.source_signature = signature
     return index
 
 
-def _read_rows(path, index, start, end):
+def _source_signature(path):
+    path = Path(path)
+    stat = path.stat()
+    return str(path.resolve()), stat.st_size, stat.st_mtime_ns
+
+
+def _read_rows(path, index, start, end, session='all', days=None):
     """Yield OHLCV rows over an inclusive date range, preserving CSV order."""
-    days = [day for day in index.day_offsets if start <= day <= end]
+    days = [day for day in index.day_offsets if start <= day <= end and (days is None or day in days)]
     if not days:
         return
     with path.open('r', encoding='utf-8', newline='') as f:
@@ -117,7 +138,11 @@ def _read_rows(path, index, start, end):
             day = stamp[:10]
             if day > end:
                 break
-            date = dt.datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S')
+            # Skip ETH before allocating datetimes and OHLCV mappings. Most
+            # requests need only the RTH part of the 80-session warmup window.
+            if session == 'rth' and (day not in index.rth_daily or not '09:30:00' <= stamp[11:] < '16:15:00'):
+                continue
+            date = dt.datetime.fromisoformat(stamp)
             yield day, date, dict(
                 time=int(date.replace(tzinfo=dt.timezone.utc).timestamp()),
                 open=float(row[2]), high=float(row[3]), low=float(row[4]),
@@ -229,28 +254,17 @@ def _enrich(bars, adr, gaps):
     return bars
 
 
-def read_bars(path, index, start, end, minutes, session='all', adjustment='back'):
-    """Return interval bars with indicators warmed before the requested range."""
-    start_date, end_date = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
-    if start > end or (end_date - start_date).days > 30 or minutes not in (1, 5, 15, 60):
-        raise ValueError('请选择不超过 31 个自然日的日期范围及有效周期')
-    if adjustment not in ('back', 'raw'):
-        raise ValueError('adjustment 必须为 back 或 raw')
-    if session not in ('all', 'rth'):
-        raise ValueError('session 必须为 all 或 rth')
-
-    if session == 'rth':
-        warmup_days = index.rth_sessions
-    else:
-        warmup_days = index.day_offsets
-    prior_days = [day for day in warmup_days if day < start][-EMA_WARMUP_SESSIONS:]
-    scan_start = prior_days[0] if prior_days else start
+def _daily_bars(path, index, day, minutes, session, adjustment):
+    key = (day, minutes, session, adjustment, index.roll_adjuster.revision)
+    with index.bar_cache_lock:
+        cached = index.bar_cache.get(key)
+        if cached is not None:
+            index.bar_cache.move_to_end(key)
+            return cached
     bars = []
-    for day, date, row in _read_rows(path, index, scan_start, end):
-        if session == 'rth' and not _is_rth(day, date):
-            continue
+    for day, date, row in _read_rows(path, index, day, day, session=session):
         if adjustment == 'back':
-            row = index.roll_adjuster.adjust_bar(date.strftime('%Y-%m-%d %H:%M:%S'), row)
+            row = index.roll_adjuster.adjust_bar(date.isoformat(sep=' ', timespec='seconds'), row)
         bucket = _bucket_time(date, minutes, session)
         if bars and bars[-1]['time'] == bucket:
             bar = bars[-1]
@@ -263,15 +277,60 @@ def read_bars(path, index, start, end, minutes, session='all', adjustment='back'
             bars.append(bar)
         if _is_rth(day, date) and (session == 'rth' or minutes in (1, 5, 15)):
             bar['_hasRthGap'] = True
-            # Count RTH clock slots so missing source minutes do not renumber
-            # later bars. An all-session 60-minute bucket can straddle 09:30.
             offset = date.hour * 60 + date.minute - RTH_OPEN
             bar['_barCount'] = offset // minutes + 1
+    cached = tuple(bars)
+    with index.bar_cache_lock:
+        previous = index.bar_cache.pop(key, ())
+        index.bar_cache_rows -= len(previous)
+        index.bar_cache[key] = cached
+        index.bar_cache_rows += len(cached)
+        while index.bar_cache and (index.bar_cache_rows > MAX_CACHED_BARS or len(index.bar_cache) > MAX_CACHED_DAYS):
+            _, removed = index.bar_cache.popitem(last=False)
+            index.bar_cache_rows -= len(removed)
+    return cached
+
+
+def read_bars(path, index, start, end, minutes, session='all', adjustment='back'):
+    """Return interval bars with indicators warmed before the requested range."""
+    start_date, end_date = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+    if start > end or (end_date - start_date).days > 30 or minutes not in (1, 5, 15, 60):
+        raise ValueError('请选择不超过 31 个自然日的日期范围及有效周期')
+    if adjustment not in ('back', 'raw'):
+        raise ValueError('adjustment 必须为 back 或 raw')
+    if session not in ('all', 'rth'):
+        raise ValueError('session 必须为 all 或 rth')
+    try:
+        signature = _source_signature(path)
+    except OSError as exc:
+        raise ValueError('CSV 无法读取，请检查文件并重启服务') from exc
+    if index.source_signature is not None and signature != index.source_signature:
+        raise ValueError('CSV 已变化，请重启服务重新索引')
+
+    if session == 'rth':
+        warmup_days = index.rth_sessions
+    else:
+        warmup_days = index.day_offsets
+    prior_days = [day for day in warmup_days if day < start][-EMA_WARMUP_SESSIONS:]
+    scan_start = prior_days[0] if prior_days else start
+    bars = []
+    days = index.rth_sessions if session == 'rth' else index.day_offsets
+    for day in days:
+        if scan_start <= day <= end:
+            # Enrichment is request-specific and mutates its input. Never let
+            # indicators or caller edits leak back into the shared day cache.
+            bars.extend(dict(bar) for bar in _daily_bars(path, index, day, minutes, session, adjustment))
 
     daily = index.adjusted_daily if adjustment == 'back' else index.rth_daily
     adr = _adr_by_day(index, daily)
     bars = _enrich(bars, adr, _rth_gaps_by_day(index, daily))
-    return [bar for bar in bars if start <= dt.datetime.fromtimestamp(bar['time'], dt.timezone.utc).date().isoformat() <= end]
+    result = [bar for bar in bars if start <= dt.datetime.fromtimestamp(bar['time'], dt.timezone.utc).date().isoformat() <= end]
+    try:
+        if _source_signature(path) != signature:
+            raise ValueError('CSV 已变化，请重启服务重新索引')
+    except OSError as exc:
+        raise ValueError('CSV 无法读取，请检查文件并重启服务') from exc
+    return result
 
 
 def read_review(path, index, target_date, adjustment='back'):
@@ -310,7 +369,19 @@ def read_review(path, index, target_date, adjustment='back'):
     }
 
 
-def make_handler(path, index):
+def make_handler(path, index, encyclopedia_db=None):
+    store_path = encyclopedia_db or DEFAULT_ENCYCLOPEDIA_DB
+    store = None
+    store_lock = threading.Lock()
+
+    def get_store():
+        nonlocal store
+        if store is None:
+            with store_lock:
+                if store is None:
+                    store = EncyclopediaStore(store_path)
+        return store
+
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -328,6 +399,11 @@ def make_handler(path, index):
 
         def do_GET(self):
             url = urlparse(self.path)
+            if url.path == '/api/encyclopedia':
+                try:
+                    return self._send_json(get_store().snapshot())
+                except sqlite3.Error:
+                    return self._send_json({'error': '百科存储暂时不可用'}, 500)
             if url.path in ('/api/meta', '/api/bars', '/api/review'):
                 try:
                     if url.path == '/api/meta':
@@ -361,10 +437,64 @@ def make_handler(path, index):
 
             # Expose only the page assets. In particular, the copied CSV is
             # never downloadable through SimpleHTTPRequestHandler.
-            assets = {'/', '/index.html', '/app.js', '/replay.js', '/drawings.js', '/vendor/drawing/lightweight-charts-drawing-0.6.3.mjs', '/vendor/drawing/LICENSE', '/vendor/dist/lightweight-charts.standalone.production.js', '/vendor/LICENSE'}
+            assets = {'/', '/index.html', '/app.js', '/replay.js', '/drawings.js', '/encyclopedia.js', '/encyclopedia.css', '/vendor/drawing/lightweight-charts-drawing-0.6.3.mjs', '/vendor/drawing/LICENSE', '/vendor/dist/lightweight-charts.standalone.production.js', '/vendor/LICENSE'}
             if url.path not in assets:
                 return self.send_error(404)
             return super().do_GET()
+
+        def _send_json(self, payload, status=200):
+            body = json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _local_same_origin(self):
+            host = self.headers.get('Host', '')
+            try:
+                if urlparse(f'//{host}').hostname not in ('127.0.0.1', 'localhost', '::1'):
+                    return False
+            except ValueError:
+                return False
+            origin = self.headers.get('Origin')
+            if origin is None:
+                return True
+            parsed = urlparse(origin)
+            if parsed.scheme != 'http' or parsed.path not in ('', '/') or parsed.params or parsed.query or parsed.fragment:
+                return False
+            try:
+                return parsed.hostname in ('127.0.0.1', 'localhost', '::1') and parsed.netloc.lower() == host.lower()
+            except ValueError:
+                return False
+
+        def do_POST(self):
+            if urlparse(self.path).path != '/api/encyclopedia':
+                return self.send_error(404)
+            if not self._local_same_origin():
+                return self._send_json({'error': '仅允许同源本地请求'}, 403)
+            if self.headers.get_content_type() != 'application/json':
+                return self._send_json({'error': '请求必须使用 application/json'}, 415)
+            try:
+                length = int(self.headers.get('Content-Length', ''))
+                if length < 0 or length > MAX_ENCYCLOPEDIA_REQUEST:
+                    raise ValueError
+            except ValueError:
+                self.close_connection = True
+                return self._send_json({'error': '请求长度无效或百科备份超过 64 MB'}, 413)
+            try:
+                payload = json.loads(self.rfile.read(length))
+                result = get_store().mutate(payload)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return self._send_json({'error': 'JSON 格式无效'}, 400)
+            except (ValueError, TypeError) as exc:
+                return self._send_json({'error': str(exc)}, 400)
+            except sqlite3.IntegrityError:
+                return self._send_json({'error': '名称已存在或关联数据冲突'}, 409)
+            except sqlite3.Error:
+                return self._send_json({'error': '百科存储暂时不可用'}, 500)
+            return self._send_json(result)
     return Handler
 
 
@@ -373,13 +503,14 @@ def main():
     parser.add_argument('--csv', type=Path, default=DEFAULT_CSV, help='ES CSV 路径')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--roll-overrides', type=Path, default=DEFAULT_ROLL_OVERRIDES, help='换月候选修正 JSON 路径')
+    parser.add_argument('--encyclopedia-db', type=Path, default=DEFAULT_ENCYCLOPEDIA_DB, help='百科 SQLite 数据库路径')
     args = parser.parse_args()
     path = args.csv.expanduser().resolve()
     print(f'正在索引 {path.name}，请稍候…', flush=True)
     overrides = load_overrides(args.roll_overrides.expanduser())
     index = build_index(path, overrides)
     print(f'估算换月调整：{sum(event["enabled"] for event in index.roll_adjuster.events)} 处；RTH 09:30–16:15（81 根 5m）。', flush=True)
-    server = ThreadingHTTPServer(('127.0.0.1', args.port), make_handler(path, index))
+    server = ThreadingHTTPServer(('127.0.0.1', args.port), make_handler(path, index, args.encyclopedia_db.expanduser()))
     print(f'数据范围 {index.first} 至 {index.last}。打开 http://127.0.0.1:{args.port}', flush=True)
     try:
         server.serve_forever()
